@@ -50,7 +50,7 @@ for f in range(n_frames):
     xf = x[:, f * n_tokens_p_frame:(f + 1) * n_tokens_p_frame, :]
     for l in range(n_layers):
         # self-attention
-        x_sa, s = pom.state_forward(xf, xf, state=state)
+        x_sa, s = pom.state_forward(xf, xf, state=state[l])
         xf = xf + x_sa
         # ffw
         xf = xf + ffw(xf)
