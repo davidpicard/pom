@@ -153,11 +153,11 @@ def polynomial_selection_(x: torch.Tensor, h: torch.Tensor, n_sel_heads: int) ->
     Returns:
         Gated output tensor
     """
+    b, n, c = x.shape
+    bb, nn, d = h.shape
     s = F.sigmoid(x).unsqueeze(-1)
-    orig_shape = h.shape
-    new_shape = (*h.shape[:-1], n_sel_heads, h.shape[-1] // n_sel_heads)
-    h = h.view(new_shape)
-    return (s * h).view(orig_shape)
+    h = h.view(bb, nn, c, -1)
+    return (s * h).view(b, n, d)
 
 
 # =============================================================================
