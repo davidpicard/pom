@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch._dynamo
 from typing import Optional, Tuple, Dict, Any
+try:
+    import torch_scatter
+except ImportError:
+    pass
 
 # =============================================================================
 # Core Polynomial Functions
@@ -261,6 +265,56 @@ class PoM(nn.Module):
             h = self.po_proj(xc)
         sh = self.pom(s, h, self.po_coeff, self.order, self.n_sel_heads, mask)
 
+        return self.ag_proj(sh)
+
+    def scatter_forward(self, xq, offset):
+        """
+        Forward pass of the PoM module for a self-attention-like operation using scatter to avoid padding.
+
+        Args:
+            xq (torch.Tensor): The query input tensor of size (batch x n_tokens, dimension).
+            offset (torch.Tensor): Tensor containing the offsets to the start of each chunk in the input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor after applying the PoM operation.
+        """
+        if offset[0] == 0:
+            offset = offset[1:]
+
+        s = self.se_proj(xq)
+        if self.n_groups > 1:
+            h = self.po_proj(xc.transpose(1, 2)).transpose(1, 2)
+        else:
+            h = self.po_proj(xc)
+
+        if self.order == 2:
+            h = po2(h, self.po_coeff)
+        elif self.order == 3:
+            h = po3(h, self.po_coeff)
+        elif self.order == 4:
+            h = po4(h, self.po_coeff)
+        else:
+            # Generic case for k > 4
+            h = pom_activation(h).unsqueeze(-1)
+            h = torch.cat([h ** i for i in range(self.order)], dim=-1)  # TODO vectorize
+            h = (h * self.po_coeff).sum(-1)
+
+        # Aggregate the h along the offset using a scatter operation
+        h = torch_scatter.segment_csr(
+                src=h.to(torch.float32),
+                indptr=nn.functional.pad(offset, (1, 0)),
+                reduce="mean",
+            )
+
+        # Split the s tensor into chunks based on the offset
+        chunks = torch.tensor_split(F.sigmoid(s), offset[:-1].cpu(), dim=0) # tuple of tensors
+        # Element-wise multiplication of each chunk with the corresponding h
+        sh = torch.concatenate([
+                chunks[i] * h[i]
+                for i in range(h.shape[0])
+                    ])
+
+        # aggregation
         return self.ag_proj(sh)
 
     def state_forward(self, xq: torch.Tensor, xc: Optional[torch.Tensor] = None,
