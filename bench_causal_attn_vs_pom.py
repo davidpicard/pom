@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Benchmark: Flash Attention vs Triton-optimized PoM.
+"""Benchmark: Causal Flash Attention vs Triton-optimized Causal PoM.
 
 Three mixers are compared, all with the same (B, N, dim) input and output:
 
-  jit-attn   Current model attention (manual SDPA, materialises N×N matrix).
-  flash-attn  F.scaled_dot_product_attention — Flash Attention 2 via cuDNN.
-  pom-k{2-5}  ComPoM with expand=2, degree 2 to 5 (comparable param count
-              to attention; higher degree = richer features but more work).
+  flash-causal   F.scaled_dot_product_attention with is_causal=True.
+  pom-causal-k{2-5}  PoM with mask="causal", using the Triton causal kernel.
+                     degree 2 to 5 (comparable param count to attention).
 
-Both forward and backward passes are timed. N is swept from 64 to 2048 to
+Both forward and backward passes are timed. N is swept from 64 to 8192 to
 expose the O(N²) vs O(N) scaling difference.
 
 Usage:
-    python bench_attn_vs_pom.py
+    python bench_causal_attn_vs_pom.py
 """
 import sys
 import time
@@ -35,19 +34,14 @@ print()
 
 
 # =============================================================================
-# Mixer modules  (all take (B, N, D) → (B, N, D), no RoPE, eval mode)
+# Mixer modules  (all take (B, N, D) → (B, N, D), causal, eval mode)
 # =============================================================================
 
-class AttnMixer(nn.Module):
-    """Attention.
-
-    uses the manual SDPA that materialises the full
-    N×N attention matrix in fp32.
-    """
+class CausalFlashAttnMixer(nn.Module):
+    """Causal attention using F.scaled_dot_product_attention (is_causal=True)."""
     def __init__(self, dim: int, num_heads: int):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
         self.qkv  = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
 
@@ -56,48 +50,23 @@ class AttnMixer(nn.Module):
         H, D = self.num_heads, C // self.num_heads
         qkv = self.qkv(x).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        scale = 1.0 / math.sqrt(D)
-        with torch.amp.autocast('cuda',enabled=False):
-            w = q.float() @ k.float().transpose(-2, -1) * scale
-        w = torch.softmax(w, dim=-1).to(v.dtype)
-        x = (w @ v).transpose(1, 2).reshape(B, N, C)
-        return self.proj(x)
-
-
-class FlashAttnMixer(nn.Module):
-    """Attention using F.scaled_dot_product_attention (Flash Attention 2).
-
-    only the core SDPA call differs.
-    """
-    def __init__(self, dim: int, num_heads: int):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.qkv  = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-        H, D = self.num_heads, C // self.num_heads
-        qkv = self.qkv(x).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        x = F.scaled_dot_product_attention(q, k, v)
+        x = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj(x)
 
 
-class PoMMixer(nn.Module):
-    """PoM polynomial mixer (standalone, no RoPE).
+class CausalPoMMixer(nn.Module):
+    """PoM with causal masking (mask="causal" → Triton causal kernel on CUDA).
 
-    n_sel_heads=num_heads matches PoMWrapper.
+    n_sel_heads=num_heads matches the attention param count comparison.
     """
     def __init__(self, dim: int, num_heads: int, expand: int = 1, degree: int = 3):
         super().__init__()
         self.pom = PoM(dim=dim, degree=degree, expand=expand,
-                          n_groups=1, n_sel_heads=num_heads)
+                       n_groups=1, n_sel_heads=num_heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pom(x)
+        return self.pom(x, mask="causal")
 
 
 # =============================================================================
@@ -180,12 +149,11 @@ Ns = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
 # =============================================================================
 
 mixers = {
-    "attn" : AttnMixer(DIM, NUM_HEADS),
-    "flash-attn": FlashAttnMixer(DIM, NUM_HEADS),
-    "pom-k2"   : PoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=2),
-    "pom-k3"   : PoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=3),
-    "pom-k4"   : PoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=4),
-    "pom-k5"   : PoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=5),
+    "flash-causal" : CausalFlashAttnMixer(DIM, NUM_HEADS),
+    "pom-causal-k2": CausalPoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=2),
+    "pom-causal-k3": CausalPoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=3),
+    "pom-causal-k4": CausalPoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=4),
+    "pom-causal-k5": CausalPoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=5),
 }
 
 for name, m in mixers.items():
@@ -193,10 +161,10 @@ for name, m in mixers.items():
 
 print(f"dim={DIM}, num_heads={NUM_HEADS}, B={B}, dtype={DTYPE}")
 print()
-print(f"  {'mixer':<12}  params")
-print(f"  {'-'*12}  ------")
+print(f"  {'mixer':<16}  params")
+print(f"  {'-'*16}  ------")
 for name, m in mixers.items():
-    print(f"  {name:<12}  {param_count(m)}")
+    print(f"  {name:<16}  {param_count(m)}")
 print()
 
 
@@ -207,13 +175,13 @@ print()
 COLS = list(mixers.keys())
 
 def print_header():
-    col_w = 11
+    col_w = 14
     hdr = f"{'N':>6}  " + "  ".join(f"{c:>{col_w}}" for c in COLS)
     print(hdr)
     print("-" * len(hdr))
 
 def print_row(N, times: dict):
-    col_w = 11
+    col_w = 14
     vals = []
     for name in COLS:
         t = times.get(name)
@@ -227,9 +195,9 @@ def print_row(N, times: dict):
 for section, time_fn in [("FORWARD", time_fwd), ("BACKWARD", time_bwd)]:
     req_grad = (section == "BACKWARD")
 
-    print("=" * 70)
+    print("=" * 80)
     print(f"{section}  (B={B}, dim={DIM}, bfloat16, median 100 runs, ms)")
-    print("=" * 70)
+    print("=" * 80)
     print()
     print_header()
 
@@ -238,7 +206,6 @@ for section, time_fn in [("FORWARD", time_fwd), ("BACKWARD", time_bwd)]:
         for name, m in mixers.items():
             x = torch.randn(B, N, DIM, device=device, dtype=DTYPE,
                             requires_grad=req_grad)
-            # Enable param grads only for backward (cleaner forward timing)
             for p in m.parameters():
                 p.requires_grad_(req_grad)
 

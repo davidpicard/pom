@@ -6,8 +6,13 @@ from typing import Optional, Dict, Any, Tuple
 try:
     from .pom_triton import poly_agg_mean_triton, TRITON_AVAILABLE
 except ImportError:
-    print("Triton no available, PoM might be slow")
+    print("Triton not available, PoM might be slow")
     TRITON_AVAILABLE = False
+
+try:
+    from .pom_triton_causal import poly_agg_causal_triton, TRITON_CAUSAL_AVAILABLE
+except ImportError:
+    TRITON_CAUSAL_AVAILABLE = False
 
 
 # =============================================================================
@@ -51,14 +56,18 @@ def polynomial_aggregation_(
         x:     (B, N, D) input
         coeff: (D, K) polynomial coefficients
         k:     polynomial degree
-        mask:  None, (B, N) for masked mean, or (B, M, N) for cross-attention
+        mask:  None, "causal", (B, N) for masked mean, or (B, M, N) for cross-attention
 
     Returns:
-        (B, 1, D) for mask=None or 2-D mask; (B, M, D) for 3-D mask
+        (B, 1, D) for mask=None or 2-D mask; (B, N, D) for "causal"; (B, M, D) for 3-D mask
     """
     # Fused path: no-mask CUDA → single Triton kernel (no (B,N,D,K) intermediate)
     if mask is None and TRITON_AVAILABLE and x.is_cuda:
         return poly_agg_mean_triton(x, coeff, k)
+
+    # Fused path: causal CUDA → single Triton kernel (no N×N mask materialised)
+    if mask == "causal" and TRITON_CAUSAL_AVAILABLE and x.is_cuda:
+        return poly_agg_causal_triton(x, coeff, k)
 
     # PyTorch fallback: compute polynomial powers iteratively to avoid h**i overhead
     h = pom_activation(x).unsqueeze(-1)  # (B, N, D, 1)
@@ -70,11 +79,15 @@ def polynomial_aggregation_(
 
     if mask is None:
         return h.mean(dim=1, keepdim=True)
+    if mask == "causal":
+        B, N, _ = h.shape
+        causal_mask = torch.tril(torch.ones(N, N, device=h.device, dtype=h.dtype))
+        return full_mask_mixer(h, causal_mask.unsqueeze(0).expand(B, -1, -1))
     if mask.dim() == 2:
         return mask_mixer(h, mask.to(h.device))
     if mask.dim() == 3:
         return full_mask_mixer(h, mask.to(h.device))
-    raise ValueError(f'Unsupported mask dim {mask.dim()}: expected 2 or 3.')
+    raise ValueError(f'Unsupported mask: expected None, "causal", or a 2/3-D tensor.')
 
 
 def polynomial_selection_(s: torch.Tensor, h: torch.Tensor, n_sel_heads: int) -> torch.Tensor:
