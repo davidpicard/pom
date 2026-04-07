@@ -14,6 +14,11 @@ try:
 except ImportError:
     TRITON_CAUSAL_AVAILABLE = False
 
+try:
+    from .pom_triton_masked import poly_agg_masked_triton, TRITON_MASKED_AVAILABLE
+except ImportError:
+    TRITON_MASKED_AVAILABLE = False
+
 
 # =============================================================================
 # Core activation
@@ -56,7 +61,7 @@ def polynomial_aggregation_(
         x:     (B, N, D) input
         coeff: (D, K) polynomial coefficients
         k:     polynomial degree
-        mask:  None, "causal", (B, N) for masked mean, or (B, M, N) for cross-attention
+        mask:  None, "causal", (B, N) tensor for masked mean, or (B, M, N) for cross-attention
 
     Returns:
         (B, 1, D) for mask=None or 2-D mask; (B, N, D) for "causal"; (B, M, D) for 3-D mask
@@ -68,6 +73,11 @@ def polynomial_aggregation_(
     # Fused path: causal CUDA → single Triton kernel (no N×N mask materialised)
     if mask == "causal" and TRITON_CAUSAL_AVAILABLE and x.is_cuda:
         return poly_agg_causal_triton(x, coeff, k)
+
+    # Fused path: 1-D mask CUDA → single Triton kernel (no (B,N,D,K) intermediate)
+    if (isinstance(mask, torch.Tensor) and mask.dim() == 2
+            and TRITON_MASKED_AVAILABLE and x.is_cuda):
+        return poly_agg_masked_triton(x, mask, coeff, k)
 
     # PyTorch fallback: compute polynomial powers iteratively to avoid h**i overhead
     h = pom_activation(x).unsqueeze(-1)  # (B, N, D, 1)
