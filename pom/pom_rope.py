@@ -76,6 +76,15 @@ from .pom import (
     full_mask_mixer,
 )
 
+try:
+    from .pom_triton_rope import (
+        poly_agg_rope_mean_triton,
+        poly_agg_rope_causal_triton,
+        TRITON_ROPE_AVAILABLE,
+    )
+except ImportError:
+    TRITON_ROPE_AVAILABLE = False
+
 
 # =============================================================================
 # Stand-alone RoPE utilities
@@ -468,15 +477,42 @@ class PoMRoPE(PoM):
         # h_proj : (B, N, D_po)  — linear features for context (pre-activation)
         # s      : (B, T, D_se)  — hardsigmoid gating for query
 
-        # ---- polynomial expansion (per-token, no aggregation yet) -------
-        h = _poly_features(h_proj, self.po_coeff, self.order)  # (B, N, D_po)
-
         # ---- resolve context positions ----------------------------------
         eff_ctx_pos    = ctx_positions    if ctx_positions    is not None else (positions    if self_mixing else None)
         eff_ctx_pos_hw = ctx_positions_hw if ctx_positions_hw is not None else (positions_hw if self_mixing else None)
 
-        # ---- apply RoPE to context polynomial features ------------------
-        h = self._rope(h, eff_ctx_pos, eff_ctx_pos_hw)
+        # ---- fused poly + RoPE + aggregate (Triton fast paths) ----------
+        # Conditions: CUDA tensor, 1-D RoPE, unmasked or causal mask.
+        # 2-D RoPE and other mask types fall through to the PyTorch path.
+        _use_triton = (
+            TRITON_ROPE_AVAILABLE
+            and h_proj.is_cuda
+            and not self.rope_2d
+            and positions_hw is None
+        )
+        if _use_triton and mask is None:
+            ctx_pos = eff_ctx_pos
+            if ctx_pos is None:
+                ctx_pos = torch.arange(h_proj.shape[1], device=h_proj.device,
+                                       dtype=torch.int64)
+            h_agg = poly_agg_rope_mean_triton(
+                h_proj, self.po_coeff, self.order,
+                self.freqs_cos, self.freqs_sin, ctx_pos,
+            )
+        elif _use_triton and mask == "causal":
+            ctx_pos = eff_ctx_pos
+            if ctx_pos is None:
+                ctx_pos = torch.arange(h_proj.shape[1], device=h_proj.device,
+                                       dtype=torch.int64)
+            h_agg = poly_agg_rope_causal_triton(
+                h_proj, self.po_coeff, self.order,
+                self.freqs_cos, self.freqs_sin, ctx_pos,
+            )
+        else:
+            # PyTorch fallback: poly → RoPE → aggregate
+            h = _poly_features(h_proj, self.po_coeff, self.order)
+            h = self._rope(h, eff_ctx_pos, eff_ctx_pos_hw)
+            h_agg = _aggregate(h, mask)
 
         # ---- apply RoPE to query selection signal -----------------------
         # For n_sel_heads ≤ 1: s has the full D_po channels → standard RoPE.
@@ -484,9 +520,6 @@ class PoMRoPE(PoM):
         # the frequency tables so each scalar gate aligns with its head's
         # leading frequency in H.
         s = self._rope(s, positions, positions_hw)
-
-        # ---- aggregate context with mask --------------------------------
-        h_agg = _aggregate(h, mask)     # (B, G, D_po)
 
         # ---- select and project -----------------------------------------
         sh = polynomial_selection_(s, h_agg, self.n_sel_heads)
