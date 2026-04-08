@@ -1,5 +1,7 @@
 # PoM
-Official implementation of the [Polynomial Mixer](https://arxiv.org/abs/2411.12663)
+Official implementation of the [Polynomial Mixer](https://arxiv.org/abs/2411.12663) (CVPR'26 Findings)
+
+![teaser PoM](teaser_pom.png)
 
 ## Install
 
@@ -63,11 +65,10 @@ x = torch.cat(out, dim=1)
 ## Citing us
 
 ```
-@misc{picard24pom,
-      title={PoM: Efficient Image and Video Generation with the Polynomial Mixer}, 
-      author={David Picard and Nicolas Dufour},
-      year={2024},
-      archivePrefix={arXiv},
-      url={https://arxiv.org/abs/2411.12663} 
+@inproceedings{picard24pom,
+      title={{PoM}: {E}fficient Image and Video Generation with the Polynomial Mixer}, 
+      author={David Picard and Nicolas Dufour and Lucas Degeorge and Arijit Ghosh and Davide Allegro and Tom Ravaud and Yohann Perron and Corentin Sautier and Zeynep Sonat Baltaci and Fei Meng and Syrine Kalleli and Marta López-Rauhut and Thibaut Loiseau and Ségolène Albouy and Raphael Baena and Elliot Vincent and Loic Landrieu},
+      year={2026},
+      booktitle={CVPR Findings},
 }
 ```
