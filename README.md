@@ -1,5 +1,5 @@
 # PoM
-Official implementation of the [Polynomial Mixer](https://arxiv.org/abs/2411.12663) (CVPR'26 Findings)
+Official implementation of the [Polynomial Mixer](https://arxiv.org/abs/2604.06129) (CVPR'26 Findings)
 
 ![teaser PoM](teaser_pom.png)
 
